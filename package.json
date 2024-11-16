@@ -4,13 +4,15 @@
   "description": "",
   "main": "index.ts",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "tsc --build",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "npm run build && node index.js"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "discord.js": "^14.14.1",
-    "dotenv": "^16.4.1",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5",
     "type-steamapi": "^0.9.47"
   },
   "devDependencies": {

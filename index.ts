@@ -1,5 +1,6 @@
 import Discord, { Message } from 'discord.js';
 import SteamAPI from 'type-steamapi';
+import http from 'http';
 
 console.log("Starting process...")
 
@@ -14,7 +15,7 @@ client.on('ready', () => {
 });
 
 const customURLregex = /(https?:\/\/)?steamcommunity\.com\/id\/[\w-]+/
-const api = new SteamAPI({ apiKey: process.env.STEAM_API_KEY ?? "", cache: {enabled: true, expiresIn: 5 * 60000}});
+const api = new SteamAPI({ apiKey: process.env.STEAM_API_KEY ?? "YOURSTEAMAPIKEY", cache: {enabled: true, expiresIn: 5 * 60000}});
 
 client.on('messageCreate', (message) => {
     checkMessage(message);
@@ -66,3 +67,9 @@ function extractMatches(inputString: string): string[] {
 function removeDuplicates<T>(arr: T[]): T[] {
     return [...new Set(arr)];
 }
+
+// for replit or render to host 24/7.
+http.createServer(function (req, res) {
+    res.write("I'm alive");
+    res.end();
+  }).listen(8080);
