@@ -253,19 +253,23 @@ async function fetchTextFromUrl(url: string, maxBytes = MAX_IMPORT_BYTES): Promi
       }
 
       let size = 0;
-      const chunks: Buffer[] = [];
+      const chunks: Uint8Array[] = [];
 
       res.on('data', (chunk: Buffer) => {
         size += chunk.length;
         if (size > maxBytes) {
-          req.destroy();
-          reject(new Error('File too large for import.'));
+          req.destroy(new Error('File too large for import.'));
           return;
         }
-        chunks.push(chunk);
+        // Buffer is a Uint8Array at runtime; this keeps TS happy:
+        chunks.push(new Uint8Array(chunk));
       });
 
-      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+      res.on('end', () => {
+        const buf = Buffer.concat(chunks);
+        resolve(buf.toString('utf-8'));
+      });
+
       res.on('error', reject);
     });
 
@@ -353,7 +357,18 @@ const steamProfilesCmd = new SlashCommandBuilder()
           .setRequired(true),
       ),
   )
-  .addSubcommand((sub) => sub.setName('list').setDescription('List stored Steam profiles'))
+  .addSubcommand((sub) =>
+  sub
+    .setName('list')
+    .setDescription('List stored Steam profiles (paginated)')
+    .addIntegerOption((opt) =>
+      opt
+        .setName('page')
+        .setDescription('Page number (starts at 1)')
+        .setMinValue(1)
+        .setRequired(false),
+    ),
+)
   .addSubcommand((sub) => sub.setName('clear').setDescription('Remove ALL stored Steam profiles'))
   .addSubcommand((sub) =>
     sub
@@ -465,27 +480,43 @@ async function handleSteamprofilesCommand(interaction: ChatInputCommandInteracti
   }
 
   if (sub === 'list') {
-    const list = getGuildProfiles(interaction.guildId);
+  const list = getGuildProfiles(interaction.guildId);
 
-    if (list.length === 0) {
-      await interaction.reply({ content: 'No stored Steam profiles yet.', ephemeral: true });
-      return;
-    }
-
-    const shown = list.slice(0, 25).map((p, i) => {
-      const line = `${i + 1}. https://steamcommunity.com/profiles/${p.steamid64}`;
-      return p.note ? `${line} — ${p.note}` : line;
-    });
-
-    const more = list.length > 25 ? `\n…and ${list.length - 25} more.` : '';
-
+  if (list.length === 0) {
     await interaction.reply({
-      content: `Stored Steam profiles (${list.length}):\n${shown.join('\n')}${more}`,
+      content: 'No stored Steam profiles yet.',
       ephemeral: true,
-      allowedMentions: { parse: [] },
     });
     return;
   }
+
+  const PAGE_SIZE = 10; // safe for embed limits (description length)
+  const totalPages = Math.max(1, Math.ceil(list.length / PAGE_SIZE));
+
+  const requested = interaction.options.getInteger('page', false) ?? 1;
+  const page = Math.min(Math.max(requested, 1), totalPages);
+
+  const start = (page - 1) * PAGE_SIZE;
+  const slice = list.slice(start, start + PAGE_SIZE);
+
+  const lines = slice.map((p, idx) => {
+    const n = start + idx + 1;
+    const url = `https://steamcommunity.com/profiles/${p.steamid64}`;
+    return p.note ? `**${n}.** ${url}\n↳ ${p.note}` : `**${n}.** ${url}`;
+  });
+
+  const embed = new EmbedBuilder()
+    .setTitle('Stored Steam profiles')
+    .setDescription(lines.join('\n\n'))
+    .setFooter({ text: `Page ${page}/${totalPages} • Total ${list.length}` });
+
+  await interaction.reply({
+    embeds: [embed],
+    ephemeral: true,
+    allowedMentions: { parse: [] },
+  });
+  return;
+}
 
   if (sub === 'clear') {
     clearProfiles(interaction.guildId);
