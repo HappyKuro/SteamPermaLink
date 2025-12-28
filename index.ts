@@ -1,5 +1,7 @@
 import 'dotenv/config';
 import http from 'http';
+import fs from 'fs';
+import path from 'path';
 import SteamAPI from 'type-steamapi';
 import {
   Client,
@@ -8,15 +10,22 @@ import {
   Partials,
   Message,
   EmbedBuilder,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  ChatInputCommandInteraction,
 } from 'discord.js';
 
 console.log('Starting process...');
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const STEAM_API_KEY = process.env.STEAM_API_KEY;
+const CLIENT_ID = process.env.CLIENT_ID;
+const GUILD_ID = process.env.GUILD_ID; // optional (recommended for testing)
 
 if (!DISCORD_TOKEN) throw new Error('Missing DISCORD_TOKEN in environment.');
 if (!STEAM_API_KEY) throw new Error('Missing STEAM_API_KEY in environment.');
+if (!CLIENT_ID) throw new Error('Missing CLIENT_ID in environment.');
 
 const client = new Client({
   intents: [
@@ -32,35 +41,133 @@ const api = new SteamAPI({
   cache: { enabled: true, expiresIn: 10 * 60_000 },
 });
 
-// --- Config ---
-const USER_COOLDOWN_MS = 8_000;          // don't spam the same user
-const MESSAGE_REPLY_TTL_MS = 60 * 60_000; // remember replied messages for 1 hour
+// ---------- Config ----------
+const USER_COOLDOWN_MS = 8_000;
+const MESSAGE_REPLY_TTL_MS = 60 * 60_000;
 
-// --- Regex ---
-// Captures steam vanity ids: steamcommunity.com/id/<name>
-const STEAM_VANITY_REGEX =
+// ---------- Regex (captures full matches) ----------
+const STEAM_VANITY_ID_REGEX =
   /(?:https?:\/\/)?(?:www\.)?steamcommunity\.com\/id\/([A-Za-z0-9_-]+)(?=$|[\s)\]}>"'.,!?])/gi;
 
-// Captures steam profile ids: steamcommunity.com/profiles/<steamid64>
+const STEAM_USER_REGEX =
+  /(?:https?:\/\/)?(?:www\.)?steamcommunity\.com\/user\/([A-Za-z0-9_-]+)(?=$|[\s)\]}>"'.,!?])/gi;
+
 const STEAM_PROFILE_REGEX =
   /(?:https?:\/\/)?(?:www\.)?steamcommunity\.com\/profiles\/(\d{15,25})(?=$|[\s)\]}>"'.,!?])/gi;
 
-// --- Anti-spam state ---
+// ---------- Persistence: per-guild on/off ----------
+type GuildSettings = Record<string, { enabled: boolean }>;
+const SETTINGS_PATH = path.join(process.cwd(), 'steamfix-settings.json');
+
+function loadSettings(): GuildSettings {
+  try {
+    if (!fs.existsSync(SETTINGS_PATH)) return {};
+    return JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf-8')) as GuildSettings;
+  } catch {
+    return {};
+  }
+}
+function saveSettings(settings: GuildSettings) {
+  try {
+    fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2), 'utf-8');
+  } catch {
+    // ignore write errors
+  }
+}
+const guildSettings: GuildSettings = loadSettings();
+function isEnabled(guildId: string): boolean {
+  return guildSettings[guildId]?.enabled ?? true; // default ON
+}
+function setEnabled(guildId: string, enabled: boolean) {
+  guildSettings[guildId] = { enabled };
+  saveSettings(guildSettings);
+}
+
+// ---------- Anti-spam state ----------
 const lastReplyAtByUser = new Map<string, number>();
 const repliedMessageIds = new Map<string, number>(); // messageId -> timestamp
 
-client.once(Events.ClientReady, () => {
+// ---------- Slash command registration ----------
+const commands = [
+  new SlashCommandBuilder()
+    .setName('steamfix')
+    .setDescription('Enable or disable Steam permalink fixer in this server')
+    .addStringOption((opt) =>
+      opt
+        .setName('state')
+        .setDescription('on or off')
+        .setRequired(true)
+        .addChoices({ name: 'on', value: 'on' }, { name: 'off', value: 'off' }),
+    )
+    .toJSON(),
+];
+
+async function registerCommands() {
+  const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN!);
+
+  if (GUILD_ID) {
+    // Faster propagation for testing
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID!, GUILD_ID), {
+      body: commands,
+    });
+    console.log(`Registered guild commands in ${GUILD_ID}`);
+  } else {
+    // Global commands can take time to appear
+    await rest.put(Routes.applicationCommands(CLIENT_ID!), { body: commands });
+    console.log('Registered global commands');
+  }
+}
+
+// ---------- Event handlers ----------
+client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user?.tag}!`);
+  try {
+    await registerCommands();
+  } catch (err) {
+    console.warn('Failed to register commands:', err);
+  }
 });
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  if (interaction.commandName !== 'steamfix') return;
+  await handleSteamfixCommand(interaction);
+});
+
+async function handleSteamfixCommand(interaction: ChatInputCommandInteraction) {
+  // Only makes sense in a guild
+  if (!interaction.guildId) {
+    await interaction.reply({
+      content: 'This command can only be used in a server.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  // Optional: restrict to ManageGuild admins (uncomment if you want)
+  // if (!interaction.memberPermissions?.has('ManageGuild')) {
+  //   await interaction.reply({ content: 'You need Manage Server to do that.', ephemeral: true });
+  //   return;
+  // }
+
+  const state = interaction.options.getString('state', true);
+  const enabled = state === 'on';
+
+  setEnabled(interaction.guildId, enabled);
+
+  await interaction.reply({
+    content: `SteamFix is now **${enabled ? 'ON' : 'OFF'}** in this server.`,
+    ephemeral: true,
+  });
+}
 
 // Respond to new messages
 client.on(Events.MessageCreate, (message) => {
   void handleMessage(message, false);
 });
 
-// Respond to edits (if content changes)
-client.on(Events.MessageUpdate, (oldMsg, newMsg) => {
-  // Only handle if it's a cached Message with content
+// Respond to edits
+client.on(Events.MessageUpdate, (_oldMsg, newMsg) => {
   const message = newMsg as Message;
   void handleMessage(message, true);
 });
@@ -69,9 +176,11 @@ async function handleMessage(message: Message, fromEdit: boolean) {
   try {
     if (!message.content) return;
     if (message.author?.bot) return;
-    if (!message.guild) return; // ignore DMs (remove if you want DMs too)
+    if (!message.guildId) return;
 
-    // Don't reply repeatedly to the same message
+    // Respect per-guild toggle
+    if (!isEnabled(message.guildId)) return;
+
     cleanupRepliedMessages();
     if (repliedMessageIds.has(message.id)) return;
 
@@ -80,24 +189,25 @@ async function handleMessage(message: Message, fromEdit: boolean) {
     const last = lastReplyAtByUser.get(message.author.id) ?? 0;
     if (now - last < USER_COOLDOWN_MS) return;
 
-    // Parse (ignoring code blocks)
+    // Ignore code blocks for fewer false positives
     const content = stripCodeBlocks(message.content);
 
-    const vanityUrls = extractFullMatches(content, STEAM_VANITY_REGEX);
+    const vanityIdUrls = extractFullMatches(content, STEAM_VANITY_ID_REGEX);
+    const userUrls = extractFullMatches(content, STEAM_USER_REGEX);
     const profileUrls = extractFullMatches(content, STEAM_PROFILE_REGEX);
 
-    if (vanityUrls.length === 0 && profileUrls.length === 0) return;
+    if (vanityIdUrls.length === 0 && userUrls.length === 0 && profileUrls.length === 0) return;
 
-    // Normalize profile links immediately
     const permalinks: string[] = [];
 
+    // Normalize /profiles/<id64>
     for (const fullProfileUrl of profileUrls) {
       const id64 = extractFirstGroup(fullProfileUrl, STEAM_PROFILE_REGEX);
       if (id64) permalinks.push(`https://steamcommunity.com/profiles/${id64}`);
     }
 
-    // Resolve vanity links to /profiles/<id64>
-    for (const fullVanityUrl of vanityUrls) {
+    // Resolve /id/<name> and /user/<name>
+    for (const fullVanityUrl of [...vanityIdUrls, ...userUrls]) {
       try {
         const normalized = fullVanityUrl.startsWith('http')
           ? fullVanityUrl
@@ -106,42 +216,32 @@ async function handleMessage(message: Message, fromEdit: boolean) {
         const id64 = await api.resolve(normalized);
         permalinks.push(`https://steamcommunity.com/profiles/${id64}`);
       } catch {
-        // silent by default
+        // silent
       }
     }
 
     const uniquePermalinks = uniqueStable(permalinks);
     if (uniquePermalinks.length === 0) return;
 
-    // Build an embed (clean + no ping)
-    const plural = uniquePermalinks.length !== 1;
     const embed = new EmbedBuilder()
-      .setTitle(plural ? 'Steam permalinks' : 'Steam permalink')
+      .setTitle(uniquePermalinks.length === 1 ? 'Steam permalink' : 'Steam permalinks')
       .setDescription(uniquePermalinks.join('\n'))
-      .setFooter({
-        text: fromEdit
-          ? 'Detected after message edit.'
-          : 'Detected in your message.',
-      });
+      .setFooter({ text: fromEdit ? 'Detected after message edit.' : 'Detected in your message.' });
 
     await message.reply({
       embeds: [embed],
-      // no pings at all:
-      allowedMentions: { parse: [] },
+      allowedMentions: { parse: [] }, // no pings
     });
 
-    // mark as replied + set cooldown
     repliedMessageIds.set(message.id, now);
     lastReplyAtByUser.set(message.author.id, now);
   } catch {
-    // keep silent (or log if you want)
+    // keep quiet
   }
 }
 
-// --- Helpers ---
-
+// ---------- Helpers ----------
 function stripCodeBlocks(text: string): string {
-  // Remove triple-backtick blocks + inline backticks
   return text.replace(/```[\s\S]*?```/g, '').replace(/`[^`]*`/g, '');
 }
 
@@ -149,7 +249,6 @@ function extractFullMatches(text: string, regex: RegExp): string[] {
   const matches: string[] = [];
   regex.lastIndex = 0;
   let m: RegExpExecArray | null;
-
   while ((m = regex.exec(text)) !== null) matches.push(m[0]);
   return uniqueStable(matches);
 }
@@ -179,12 +278,12 @@ function cleanupRepliedMessages() {
   }
 }
 
-// Login
+// ---------- Login ----------
 client.login(DISCORD_TOKEN);
 
 // Keep-alive server (Render/Replit)
 http
-  .createServer((req, res) => {
+  .createServer((_req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end("I'm alive");
   })
