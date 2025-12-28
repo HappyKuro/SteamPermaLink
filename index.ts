@@ -90,8 +90,8 @@ const repliedMessageIds = new Map<string, number>(); // messageId -> timestamp
 // ---------- Slash command registration ----------
 const commands = [
   new SlashCommandBuilder()
-    .setName('steampermalinkfix')
-    .setDescription('Enable or disable Steam permalink fixer in this server')
+    .setName('steampermalink')
+    .setDescription('Enable or disable Steam permalink detection in this server')
     .addStringOption((opt) =>
       opt
         .setName('state')
@@ -130,11 +130,11 @@ client.once(Events.ClientReady, async () => {
 
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
-  if (interaction.commandName !== 'steampermalinkfix') return;
-  await handleSteamPermaLinkFixCommand(interaction);
+  if (interaction.commandName !== 'steampermalink') return;
+  await handleSteamPermaLinkCommand(interaction);
 });
 
-async function handleSteamPermaLinkFixCommand(interaction: ChatInputCommandInteraction) {
+async function handleSteamPermaLinkCommand(interaction: ChatInputCommandInteraction) {
   // Only makes sense in a guild
   if (!interaction.guildId) {
     await interaction.reply({
@@ -156,7 +156,7 @@ async function handleSteamPermaLinkFixCommand(interaction: ChatInputCommandInter
   setEnabled(interaction.guildId, enabled);
 
   await interaction.reply({
-    content: `SteamPermaLinkFix is now **${enabled ? 'ON' : 'OFF'}** in this server.`,
+    content: `SteamPermaLink is now **${enabled ? 'ON' : 'OFF'}** in this server.`,
     ephemeral: true,
   });
 }
