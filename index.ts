@@ -57,7 +57,7 @@ const STEAM_PROFILE_REGEX =
 
 // ---------- Persistence: per-guild on/off ----------
 type GuildSettings = Record<string, { enabled: boolean }>;
-const SETTINGS_PATH = path.join(process.cwd(), 'steamfix-settings.json');
+const SETTINGS_PATH = path.join(process.cwd(), 'steampermalink-settings.json');
 
 function loadSettings(): GuildSettings {
   try {
@@ -90,7 +90,7 @@ const repliedMessageIds = new Map<string, number>(); // messageId -> timestamp
 // ---------- Slash command registration ----------
 const commands = [
   new SlashCommandBuilder()
-    .setName('steamfix')
+    .setName('steampermalinkfix')
     .setDescription('Enable or disable Steam permalink fixer in this server')
     .addStringOption((opt) =>
       opt
@@ -130,11 +130,11 @@ client.once(Events.ClientReady, async () => {
 
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
-  if (interaction.commandName !== 'steamfix') return;
-  await handleSteamfixCommand(interaction);
+  if (interaction.commandName !== 'steampermalinkfix') return;
+  await handleSteamPermaLinkFixCommand(interaction);
 });
 
-async function handleSteamfixCommand(interaction: ChatInputCommandInteraction) {
+async function handleSteamPermaLinkFixCommand(interaction: ChatInputCommandInteraction) {
   // Only makes sense in a guild
   if (!interaction.guildId) {
     await interaction.reply({
@@ -156,7 +156,7 @@ async function handleSteamfixCommand(interaction: ChatInputCommandInteraction) {
   setEnabled(interaction.guildId, enabled);
 
   await interaction.reply({
-    content: `SteamFix is now **${enabled ? 'ON' : 'OFF'}** in this server.`,
+    content: `SteamPermaLinkFix is now **${enabled ? 'ON' : 'OFF'}** in this server.`,
     ephemeral: true,
   });
 }
