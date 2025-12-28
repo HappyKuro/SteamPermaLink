@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import http from 'http';
+import https from 'https';
 import fs from 'fs';
 import path from 'path';
 import SteamAPI from 'type-steamapi';
@@ -18,18 +19,18 @@ import {
 
 console.log('Starting process...');
 
-// --------- ENV ---------
+// ---------------- ENV ----------------
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const STEAM_API_KEY = process.env.STEAM_API_KEY;
 const CLIENT_ID = process.env.CLIENT_ID;
-const GUILD_ID = process.env.GUILD_ID; // optional (recommended for development)
+const GUILD_ID = process.env.GUILD_ID; // optional (fast command updates)
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
 
 if (!DISCORD_TOKEN) throw new Error('Missing DISCORD_TOKEN in environment.');
 if (!STEAM_API_KEY) throw new Error('Missing STEAM_API_KEY in environment.');
 if (!CLIENT_ID) throw new Error('Missing CLIENT_ID in environment.');
 
-// --------- CLIENT ---------
+// ---------------- CLIENT ----------------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -39,31 +40,37 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
-// --------- STEAM API ---------
+// ---------------- STEAM API ----------------
 const api = new SteamAPI({
   apiKey: STEAM_API_KEY,
   cache: { enabled: true, expiresIn: 10 * 60_000 },
 });
 
-// --------- CONFIG ---------
+// ---------------- CONFIG ----------------
 const USER_COOLDOWN_MS = 8_000;
 const MESSAGE_REPLY_TTL_MS = 60 * 60_000;
 
-// Import limits (avoid abuse / long runs)
 const MAX_IMPORT_ITEMS = 300;
-const MAX_IMPORT_BYTES = 300_000; // attachment download cap
+const MAX_IMPORT_BYTES = 300_000;
 
-// --------- REGEX ---------
+const LIST_PAGE_SIZE = 10;
+
+// ---------------- REGEX ----------------
+// Profiles:
 const STEAM_VANITY_ID_REGEX =
   /(?:https?:\/\/)?(?:www\.)?steamcommunity\.com\/id\/([A-Za-z0-9_-]+)(?=$|[\s)\]}>"'.,!?])/gi;
-
 const STEAM_USER_REGEX =
   /(?:https?:\/\/)?(?:www\.)?steamcommunity\.com\/user\/([A-Za-z0-9_-]+)(?=$|[\s)\]}>"'.,!?])/gi;
-
 const STEAM_PROFILE_REGEX =
   /(?:https?:\/\/)?(?:www\.)?steamcommunity\.com\/profiles\/(\d{15,25})(?=$|[\s)\]}>"'.,!?])/gi;
 
-// --------- ANTI-SPAM STATE ---------
+// Groups:
+const STEAM_GROUPS_REGEX =
+  /(?:https?:\/\/)?(?:www\.)?steamcommunity\.com\/groups\/([A-Za-z0-9_-]+)(?=$|[\s)\]}>"'.,!?])/gi;
+const STEAM_GID_REGEX =
+  /(?:https?:\/\/)?(?:www\.)?steamcommunity\.com\/gid\/(\d{15,25})(?=$|[\s)\]}>"'.,!?])/gi;
+
+// ---------------- ANTI-SPAM ----------------
 const lastReplyAtByUser = new Map<string, number>();
 const repliedMessageIds = new Map<string, number>(); // messageId -> timestamp
 
@@ -74,7 +81,7 @@ function cleanupRepliedMessages() {
   }
 }
 
-// --------- SETTINGS PERSISTENCE (per-guild enable/disable) ---------
+// ---------------- SETTINGS (per-guild ON/OFF) ----------------
 type GuildSettings = Record<string, { enabled: boolean }>;
 const SETTINGS_PATH = path.join(process.cwd(), 'steampermalink-settings.json');
 
@@ -96,69 +103,213 @@ function saveSettings(settings: GuildSettings) {
 const guildSettings: GuildSettings = loadSettings();
 
 function isPermalinkEnabled(guildId: string): boolean {
-  return guildSettings[guildId]?.enabled ?? true; // default ON
+  return guildSettings[guildId]?.enabled ?? true;
 }
 function setPermalinkEnabled(guildId: string, enabled: boolean) {
   guildSettings[guildId] = { enabled };
   saveSettings(guildSettings);
 }
 
-// --------- PROFILES PERSISTENCE (per-guild stored profiles) ---------
+// ---------------- GLOBAL PROFILES DB (NO GUILD IDS) ----------------
 type StoredProfile = { steamid64: string; note?: string; addedAt: number };
-type GuildProfiles = Record<string, { profiles: StoredProfile[] }>;
+type ProfilesDB = { profiles: StoredProfile[] };
+
 const PROFILES_PATH = path.join(process.cwd(), 'steamprofiles.json');
 
-function loadProfiles(): GuildProfiles {
+function loadProfiles(): ProfilesDB {
   try {
-    if (!fs.existsSync(PROFILES_PATH)) return {};
-    return JSON.parse(fs.readFileSync(PROFILES_PATH, 'utf-8')) as GuildProfiles;
+    if (!fs.existsSync(PROFILES_PATH)) return { profiles: [] };
+    const parsed = JSON.parse(fs.readFileSync(PROFILES_PATH, 'utf-8')) as ProfilesDB;
+    if (!parsed || !Array.isArray(parsed.profiles)) return { profiles: [] };
+    return parsed;
   } catch {
-    return {};
+    return { profiles: [] };
   }
 }
-function saveProfiles(data: GuildProfiles) {
+function saveProfiles(db: ProfilesDB) {
   try {
-    fs.writeFileSync(PROFILES_PATH, JSON.stringify(data, null, 2), 'utf-8');
+    fs.writeFileSync(PROFILES_PATH, JSON.stringify(db, null, 2), 'utf-8');
   } catch {
     // ignore
   }
 }
-const guildProfiles: GuildProfiles = loadProfiles();
 
-function getGuildProfiles(guildId: string): StoredProfile[] {
-  return guildProfiles[guildId]?.profiles ?? [];
-}
-function setGuildProfiles(guildId: string, profiles: StoredProfile[]) {
-  guildProfiles[guildId] = { profiles };
-  saveProfiles(guildProfiles);
-}
-function upsertProfile(guildId: string, steamid64: string, note?: string) {
-  const profiles = getGuildProfiles(guildId);
-  const idx = profiles.findIndex((p) => p.steamid64 === steamid64);
+const profilesDB: ProfilesDB = loadProfiles();
 
-  const entry: StoredProfile = {
-    steamid64,
-    note: note?.trim() ? note.trim() : undefined,
-    addedAt: Date.now(),
-  };
-
-  if (idx >= 0) profiles[idx] = { ...profiles[idx], ...entry };
-  else profiles.push(entry);
-
-  setGuildProfiles(guildId, profiles);
-}
-function removeProfile(guildId: string, steamid64: string): boolean {
-  const profiles = getGuildProfiles(guildId);
-  const next = profiles.filter((p) => p.steamid64 !== steamid64);
-  if (next.length === profiles.length) return false;
-  setGuildProfiles(guildId, next);
-  return true;
-}
-function clearProfiles(guildId: string) {
-  setGuildProfiles(guildId, []);
+function getProfiles(): StoredProfile[] {
+  return profilesDB.profiles;
 }
 
-// --------- GENERAL HELPERS ---------
+type UpsertResult = 'added' | 'updated' | 'exists';
+
+function upsertProfile(steamid64: string, note?: string): UpsertResult {
+  const list = profilesDB.profiles;
+  const idx = list.findIndex((p) => p.steamid64 === steamid64);
+
+  if (idx >= 0) {
+    const existing = list[idx];
+    const trimmed = note?.trim();
+
+    if (!trimmed || existing.note === trimmed) return 'exists';
+
+    list[idx] = { ...existing, note: trimmed, addedAt: existing.addedAt };
+    saveProfiles(profilesDB);
+    return 'updated';
+  }
+
+  list.push({ steamid64, note: note?.trim() || undefined, addedAt: Date.now() });
+  saveProfiles(profilesDB);
+  return 'added';
+}
+
+function removeProfile(steamid64: string): boolean {
+  const before = profilesDB.profiles.length;
+  profilesDB.profiles = profilesDB.profiles.filter((p) => p.steamid64 !== steamid64);
+  saveProfiles(profilesDB);
+  return profilesDB.profiles.length !== before;
+}
+
+function clearProfiles() {
+  profilesDB.profiles = [];
+  saveProfiles(profilesDB);
+}
+
+// ---------------- GLOBAL GROUPS DB (NO GUILD IDS) ----------------
+type StoredGroup = {
+  key: string; // "gid:<digits>" OR "groups:<nameLower>"
+  url: string; // canonical url
+  gid64?: string;
+  name?: string;
+  note?: string;
+  addedAt: number;
+};
+type GroupsDB = { groups: StoredGroup[] };
+
+const GROUPS_PATH = path.join(process.cwd(), 'steamgroups.json');
+
+function loadGroups(): GroupsDB {
+  try {
+    if (!fs.existsSync(GROUPS_PATH)) return { groups: [] };
+    const parsed = JSON.parse(fs.readFileSync(GROUPS_PATH, 'utf-8')) as GroupsDB;
+    if (!parsed || !Array.isArray(parsed.groups)) return { groups: [] };
+    return parsed;
+  } catch {
+    return { groups: [] };
+  }
+}
+function saveGroups(db: GroupsDB) {
+  try {
+    fs.writeFileSync(GROUPS_PATH, JSON.stringify(db, null, 2), 'utf-8');
+  } catch {
+    // ignore
+  }
+}
+
+const groupsDB: GroupsDB = loadGroups();
+
+function getGroups(): StoredGroup[] {
+  return groupsDB.groups;
+}
+
+function makeGroupFromInput(inputRaw: string, note?: string): StoredGroup | null {
+  const input = normalizeInput(inputRaw);
+
+  // gid/<digits>
+  const gid = extractFirstGroup(input, STEAM_GID_REGEX);
+  if (gid) {
+    return {
+      key: `gid:${gid}`,
+      url: `https://steamcommunity.com/gid/${gid}`,
+      gid64: gid,
+      note: note?.trim() || undefined,
+      addedAt: Date.now(),
+    };
+  }
+
+  // groups/<name>
+  const name = extractFirstGroup(input, STEAM_GROUPS_REGEX);
+  if (name) {
+    const lower = name.toLowerCase();
+    return {
+      key: `groups:${lower}`,
+      url: `https://steamcommunity.com/groups/${name}`,
+      name,
+      note: note?.trim() || undefined,
+      addedAt: Date.now(),
+    };
+  }
+
+  // allow paste without protocol: "steamcommunity.com/groups/xxx"
+  if (input.includes('steamcommunity.com/groups/')) {
+    const m = input.match(/steamcommunity\.com\/groups\/([A-Za-z0-9_-]+)/i);
+    if (m?.[1]) {
+      const nm = m[1];
+      return {
+        key: `groups:${nm.toLowerCase()}`,
+        url: `https://steamcommunity.com/groups/${nm}`,
+        name: nm,
+        note: note?.trim() || undefined,
+        addedAt: Date.now(),
+      };
+    }
+  }
+
+  if (input.includes('steamcommunity.com/gid/')) {
+    const m = input.match(/steamcommunity\.com\/gid\/(\d{15,25})/i);
+    if (m?.[1]) {
+      const gid2 = m[1];
+      return {
+        key: `gid:${gid2}`,
+        url: `https://steamcommunity.com/gid/${gid2}`,
+        gid64: gid2,
+        note: note?.trim() || undefined,
+        addedAt: Date.now(),
+      };
+    }
+  }
+
+  return null;
+}
+
+function upsertGroup(group: StoredGroup): UpsertResult {
+  const list = groupsDB.groups;
+  const idx = list.findIndex((g) => g.key === group.key);
+
+  if (idx >= 0) {
+    const existing = list[idx];
+    const trimmed = group.note?.trim();
+
+    // exists if no note change
+    if (!trimmed || existing.note === trimmed) return 'exists';
+
+    list[idx] = {
+      ...existing,
+      note: trimmed,
+      // keep original addedAt
+      addedAt: existing.addedAt,
+    };
+    saveGroups(groupsDB);
+    return 'updated';
+  }
+
+  list.push(group);
+  saveGroups(groupsDB);
+  return 'added';
+}
+
+function removeGroupByKey(key: string): boolean {
+  const before = groupsDB.groups.length;
+  groupsDB.groups = groupsDB.groups.filter((g) => g.key !== key);
+  saveGroups(groupsDB);
+  return groupsDB.groups.length !== before;
+}
+
+function clearGroups() {
+  groupsDB.groups = [];
+  saveGroups(groupsDB);
+}
+
+// ---------------- HELPERS ----------------
 function stripCodeBlocks(text: string): string {
   return text.replace(/```[\s\S]*?```/g, '').replace(/`[^`]*`/g, '');
 }
@@ -176,7 +327,6 @@ function uniqueStable<T>(arr: T[]): T[] {
 }
 
 function normalizeInput(input: string): string {
-  // Discord sometimes wraps links in <...>
   return input.trim().replace(/^<|>$/g, '');
 }
 
@@ -195,7 +345,7 @@ function extractFirstGroup(text: string, regex: RegExp): string | null {
   return m?.[1] ?? null;
 }
 
-// Resolve any supported input into steamid64
+// Resolve supported profile input into steamid64
 async function resolveToSteamId64(inputRaw: string): Promise<string | null> {
   const input = normalizeInput(inputRaw);
 
@@ -217,7 +367,7 @@ async function resolveToSteamId64(inputRaw: string): Promise<string | null> {
   }
 }
 
-// Extract any possible Steam inputs from a big pasted file/text
+// Extract many profile inputs from text
 function extractSteamCandidatesFromText(raw: string): string[] {
   const text = stripCodeBlocks(raw);
   const out: string[] = [];
@@ -225,7 +375,6 @@ function extractSteamCandidatesFromText(raw: string): string[] {
   for (const m of text.matchAll(STEAM_VANITY_ID_REGEX)) out.push(m[0]);
   for (const m of text.matchAll(STEAM_USER_REGEX)) out.push(m[0]);
   for (const m of text.matchAll(STEAM_PROFILE_REGEX)) out.push(m[0]);
-
   for (const m of text.matchAll(/\b\d{15,25}\b/g)) out.push(m[0]);
 
   for (const line of text.split(/\r?\n/)) {
@@ -241,10 +390,28 @@ function extractSteamCandidatesFromText(raw: string): string[] {
   return uniqueStable(out);
 }
 
-// Download attachment text (Discord CDN url)
-async function fetchTextFromUrl(url: string, maxBytes = MAX_IMPORT_BYTES): Promise<string> {
-  const https = await import('https');
+// Extract many group inputs from text
+function extractGroupCandidatesFromText(raw: string): string[] {
+  const text = stripCodeBlocks(raw);
+  const out: string[] = [];
 
+  for (const m of text.matchAll(STEAM_GROUPS_REGEX)) out.push(m[0]);
+  for (const m of text.matchAll(STEAM_GID_REGEX)) out.push(m[0]);
+
+  for (const line of text.split(/\r?\n/)) {
+    const s = line.trim().replace(/^<|>$/g, '');
+    if (!s) continue;
+    if (s.includes('steamcommunity.com/groups/') || s.includes('steamcommunity.com/gid/')) out.push(s);
+  }
+
+  STEAM_GROUPS_REGEX.lastIndex = 0;
+  STEAM_GID_REGEX.lastIndex = 0;
+
+  return uniqueStable(out);
+}
+
+// Download attachment text (Discord CDN)
+async function fetchTextFromUrl(url: string, maxBytes = MAX_IMPORT_BYTES): Promise<string> {
   return new Promise((resolve, reject) => {
     const req = https.get(url, (res) => {
       if (res.statusCode && res.statusCode >= 400) {
@@ -261,7 +428,6 @@ async function fetchTextFromUrl(url: string, maxBytes = MAX_IMPORT_BYTES): Promi
           req.destroy(new Error('File too large for import.'));
           return;
         }
-        // Buffer is a Uint8Array at runtime; this keeps TS happy:
         chunks.push(new Uint8Array(chunk));
       });
 
@@ -277,15 +443,23 @@ async function fetchTextFromUrl(url: string, maxBytes = MAX_IMPORT_BYTES): Promi
   });
 }
 
-async function importManyProfiles(guildId: string, candidates: string[], note?: string) {
+type ImportResult = {
+  added: number;
+  updated: number;
+  exists: number;
+  failed: number;
+  processed: number;
+  found: number;
+  truncated: boolean;
+};
+
+async function importManyProfiles(candidates: string[], note?: string): Promise<ImportResult> {
   const list = candidates.slice(0, MAX_IMPORT_ITEMS);
 
   let added = 0;
   let updated = 0;
+  let exists = 0;
   let failed = 0;
-
-  const existing = getGuildProfiles(guildId);
-  const existingSet = new Set(existing.map((p) => p.steamid64));
 
   for (const item of list) {
     const id64 = await resolveToSteamId64(item);
@@ -293,20 +467,16 @@ async function importManyProfiles(guildId: string, candidates: string[], note?: 
       failed++;
       continue;
     }
-
-    const wasExisting = existingSet.has(id64);
-    upsertProfile(guildId, id64, note);
-
-    if (wasExisting) updated++;
-    else {
-      added++;
-      existingSet.add(id64);
-    }
+    const r = upsertProfile(id64, note);
+    if (r === 'added') added++;
+    else if (r === 'updated') updated++;
+    else exists++;
   }
 
   return {
     added,
     updated,
+    exists,
     failed,
     processed: list.length,
     found: candidates.length,
@@ -314,7 +484,38 @@ async function importManyProfiles(guildId: string, candidates: string[], note?: 
   };
 }
 
-// --------- SLASH COMMANDS ---------
+async function importManyGroups(candidates: string[], note?: string): Promise<ImportResult> {
+  const list = candidates.slice(0, MAX_IMPORT_ITEMS);
+
+  let added = 0;
+  let updated = 0;
+  let exists = 0;
+  let failed = 0;
+
+  for (const item of list) {
+    const g = makeGroupFromInput(item, note);
+    if (!g) {
+      failed++;
+      continue;
+    }
+    const r = upsertGroup(g);
+    if (r === 'added') added++;
+    else if (r === 'updated') updated++;
+    else exists++;
+  }
+
+  return {
+    added,
+    updated,
+    exists,
+    failed,
+    processed: list.length,
+    found: candidates.length,
+    truncated: candidates.length > MAX_IMPORT_ITEMS,
+  };
+}
+
+// ---------------- SLASH COMMANDS ----------------
 const steamPermalinkCmd = new SlashCommandBuilder()
   .setName('steampermalink')
   .setDescription('Enable or disable Steam permalink detection in this server')
@@ -328,91 +529,87 @@ const steamPermalinkCmd = new SlashCommandBuilder()
 
 const steamProfilesCmd = new SlashCommandBuilder()
   .setName('steamprofiles')
-  .setDescription('Store and manage Steam profiles in this server')
+  .setDescription('Store and manage Steam profiles (global list)')
   .addSubcommand((sub) =>
     sub
       .setName('add')
       .setDescription('Add a Steam profile (url or SteamID64)')
       .addStringOption((opt) =>
-        opt
-          .setName('input')
-          .setDescription('Steam URL (/id, /user, /profiles) or SteamID64')
-          .setRequired(true),
+        opt.setName('input').setDescription('Steam URL (/id, /user, /profiles) or SteamID64').setRequired(true),
       )
-      .addStringOption((opt) =>
-        opt
-          .setName('note')
-          .setDescription('Optional note/label (e.g. "Trusted trader")')
-          .setRequired(false),
-      ),
+      .addStringOption((opt) => opt.setName('note').setDescription('Optional note/label').setRequired(false)),
   )
   .addSubcommand((sub) =>
     sub
       .setName('remove')
       .setDescription('Remove a stored Steam profile by SteamID64')
-      .addStringOption((opt) =>
-        opt
-          .setName('steamid64')
-          .setDescription('SteamID64 (e.g. 7656119...)')
-          .setRequired(true),
-      ),
+      .addStringOption((opt) => opt.setName('steamid64').setDescription('SteamID64').setRequired(true)),
   )
   .addSubcommand((sub) =>
-  sub
-    .setName('list')
-    .setDescription('List stored Steam profiles (paginated)')
-    .addIntegerOption((opt) =>
-      opt
-        .setName('page')
-        .setDescription('Page number (starts at 1)')
-        .setMinValue(1)
-        .setRequired(false),
-    ),
-)
+    sub
+      .setName('list')
+      .setDescription('List stored Steam profiles (paginated)')
+      .addIntegerOption((opt) => opt.setName('page').setDescription('Page number').setMinValue(1).setRequired(false)),
+  )
   .addSubcommand((sub) => sub.setName('clear').setDescription('Remove ALL stored Steam profiles'))
   .addSubcommand((sub) =>
     sub
       .setName('import')
       .setDescription('Import many Steam profiles from pasted text or a .txt attachment')
-      .addStringOption((opt) =>
-        opt
-          .setName('text')
-          .setDescription('Paste text containing Steam links/IDs (one per line or mixed)')
-          .setRequired(false),
-      )
-      .addAttachmentOption((opt) =>
-        opt
-          .setName('attachment')
-          .setDescription('Upload a .txt file containing Steam links/IDs')
-          .setRequired(false),
-      )
-      .addStringOption((opt) =>
-        opt
-          .setName('note')
-          .setDescription('Optional note applied to all imported profiles')
-          .setRequired(false),
-      ),
+      .addStringOption((opt) => opt.setName('text').setDescription('Paste text').setRequired(false))
+      .addAttachmentOption((opt) => opt.setName('attachment').setDescription('Upload .txt').setRequired(false))
+      .addStringOption((opt) => opt.setName('note').setDescription('Optional note for all').setRequired(false)),
   );
 
-const commandsJSON = [steamPermalinkCmd.toJSON(), steamProfilesCmd.toJSON()];
+const steamGroupsCmd = new SlashCommandBuilder()
+  .setName('steamgroups')
+  .setDescription('Store and manage Steam groups (global list)')
+  .addSubcommand((sub) =>
+    sub
+      .setName('add')
+      .setDescription('Add a Steam group (groups/<name> or gid/<gid64>)')
+      .addStringOption((opt) =>
+        opt.setName('input').setDescription('Steam group URL (groups/... or gid/...)').setRequired(true),
+      )
+      .addStringOption((opt) => opt.setName('note').setDescription('Optional note/label').setRequired(false)),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('remove')
+      .setDescription('Remove a stored Steam group by key (shown in list)')
+      .addStringOption((opt) => opt.setName('key').setDescription('Example: gid:123... or groups:mygroup').setRequired(true)),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('list')
+      .setDescription('List stored Steam groups (paginated)')
+      .addIntegerOption((opt) => opt.setName('page').setDescription('Page number').setMinValue(1).setRequired(false)),
+  )
+  .addSubcommand((sub) => sub.setName('clear').setDescription('Remove ALL stored Steam groups'))
+  .addSubcommand((sub) =>
+    sub
+      .setName('import')
+      .setDescription('Import many Steam groups from pasted text or a .txt attachment')
+      .addStringOption((opt) => opt.setName('text').setDescription('Paste text').setRequired(false))
+      .addAttachmentOption((opt) => opt.setName('attachment').setDescription('Upload .txt').setRequired(false))
+      .addStringOption((opt) => opt.setName('note').setDescription('Optional note for all').setRequired(false)),
+  );
+
+const commandsJSON = [steamPermalinkCmd.toJSON(), steamProfilesCmd.toJSON(), steamGroupsCmd.toJSON()];
 
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN!);
 
   if (GUILD_ID) {
-    await rest.put(Routes.applicationGuildCommands(CLIENT_ID!, GUILD_ID), {
-      body: commandsJSON,
-    });
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID!, GUILD_ID), { body: commandsJSON });
     console.log(`Registered guild commands in ${GUILD_ID}`);
   } else {
-    await rest.put(Routes.applicationCommands(CLIENT_ID!), {
-      body: commandsJSON,
-    });
+    await rest.put(Routes.applicationCommands(CLIENT_ID!), { body: commandsJSON });
     console.log('Registered global commands (can take time to appear).');
   }
 }
 
-// --------- COMMAND HANDLERS ---------
+// ---------------- COMMAND HANDLERS ----------------
 async function handleSteampermalinkCommand(interaction: ChatInputCommandInteraction) {
   if (!interaction.guildId) {
     await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
@@ -444,20 +641,21 @@ async function handleSteamprofilesCommand(interaction: ChatInputCommandInteracti
 
     const id64 = await resolveToSteamId64(input);
     if (!id64) {
-      await interaction.reply({
-        content: 'Could not resolve that to a Steam profile. Provide a valid Steam URL or SteamID64.',
-        ephemeral: true,
-      });
+      await interaction.reply({ content: 'Could not resolve that to a Steam profile.', ephemeral: true });
       return;
     }
 
-    upsertProfile(interaction.guildId, id64, note);
+    const result = upsertProfile(id64, note);
+    const url = `https://steamcommunity.com/profiles/${id64}`;
 
-    await interaction.reply({
-      content: `Saved:\nhttps://steamcommunity.com/profiles/${id64}` + (note ? `\nNote: ${note}` : ''),
-      ephemeral: true,
-      allowedMentions: { parse: [] },
-    });
+    const msg =
+      result === 'added'
+        ? `✅ **Added**\n${url}`
+        : result === 'updated'
+          ? `✏️ **Updated note**\n${url}`
+          : `⚠️ **Already exists**\n${url}`;
+
+    await interaction.reply({ content: msg, ephemeral: true, allowedMentions: { parse: [] } });
     return;
   }
 
@@ -468,11 +666,9 @@ async function handleSteamprofilesCommand(interaction: ChatInputCommandInteracti
       return;
     }
 
-    const ok = removeProfile(interaction.guildId, steamid64);
+    const ok = removeProfile(steamid64);
     await interaction.reply({
-      content: ok
-        ? `Removed https://steamcommunity.com/profiles/${steamid64}`
-        : 'That SteamID64 was not found in the stored list.',
+      content: ok ? `Removed https://steamcommunity.com/profiles/${steamid64}` : 'Not found in stored list.',
       ephemeral: true,
       allowedMentions: { parse: [] },
     });
@@ -480,47 +676,37 @@ async function handleSteamprofilesCommand(interaction: ChatInputCommandInteracti
   }
 
   if (sub === 'list') {
-  const list = getGuildProfiles(interaction.guildId);
+    const list = getProfiles();
+    if (list.length === 0) {
+      await interaction.reply({ content: 'No stored Steam profiles yet.', ephemeral: true });
+      return;
+    }
 
-  if (list.length === 0) {
-    await interaction.reply({
-      content: 'No stored Steam profiles yet.',
-      ephemeral: true,
+    const totalPages = Math.max(1, Math.ceil(list.length / LIST_PAGE_SIZE));
+    const requested = interaction.options.getInteger('page', false) ?? 1;
+    const page = Math.min(Math.max(requested, 1), totalPages);
+
+    const start = (page - 1) * LIST_PAGE_SIZE;
+    const slice = list.slice(start, start + LIST_PAGE_SIZE);
+
+    const lines = slice.map((p, idx) => {
+      const n = start + idx + 1;
+      const url = `https://steamcommunity.com/profiles/${p.steamid64}`;
+      return p.note ? `**${n}.** ${url}\n↳ ${p.note}` : `**${n}.** ${url}`;
     });
+
+    const embed = new EmbedBuilder()
+      .setTitle('Stored Steam profiles')
+      .setDescription(lines.join('\n\n'))
+      .setFooter({ text: `Page ${page}/${totalPages} • Total ${list.length}` });
+
+    await interaction.reply({ embeds: [embed], ephemeral: true, allowedMentions: { parse: [] } });
     return;
   }
 
-  const PAGE_SIZE = 10; // safe for embed limits (description length)
-  const totalPages = Math.max(1, Math.ceil(list.length / PAGE_SIZE));
-
-  const requested = interaction.options.getInteger('page', false) ?? 1;
-  const page = Math.min(Math.max(requested, 1), totalPages);
-
-  const start = (page - 1) * PAGE_SIZE;
-  const slice = list.slice(start, start + PAGE_SIZE);
-
-  const lines = slice.map((p, idx) => {
-    const n = start + idx + 1;
-    const url = `https://steamcommunity.com/profiles/${p.steamid64}`;
-    return p.note ? `**${n}.** ${url}\n↳ ${p.note}` : `**${n}.** ${url}`;
-  });
-
-  const embed = new EmbedBuilder()
-    .setTitle('Stored Steam profiles')
-    .setDescription(lines.join('\n\n'))
-    .setFooter({ text: `Page ${page}/${totalPages} • Total ${list.length}` });
-
-  await interaction.reply({
-    embeds: [embed],
-    ephemeral: true,
-    allowedMentions: { parse: [] },
-  });
-  return;
-}
-
   if (sub === 'clear') {
-    clearProfiles(interaction.guildId);
-    await interaction.reply({ content: 'Cleared all stored Steam profiles for this server.', ephemeral: true });
+    clearProfiles();
+    await interaction.reply({ content: 'Cleared all stored Steam profiles (global).', ephemeral: true });
     return;
   }
 
@@ -530,17 +716,13 @@ async function handleSteamprofilesCommand(interaction: ChatInputCommandInteracti
     const note = interaction.options.getString('note', false) ?? undefined;
 
     if (!text && !attachment) {
-      await interaction.reply({
-        content: 'Provide either `text` (paste) or an `attachment` (.txt).',
-        ephemeral: true,
-      });
+      await interaction.reply({ content: 'Provide `text` or an `attachment` (.txt).', ephemeral: true });
       return;
     }
 
     await interaction.deferReply({ ephemeral: true });
 
     let inputText = text;
-
     if (attachment) {
       try {
         inputText += '\n' + (await fetchTextFromUrl(attachment.url));
@@ -552,25 +734,148 @@ async function handleSteamprofilesCommand(interaction: ChatInputCommandInteracti
 
     const candidates = extractSteamCandidatesFromText(inputText);
     if (candidates.length === 0) {
-      await interaction.editReply('No Steam links or SteamID64 values found in the input.');
+      await interaction.editReply('No Steam links or SteamID64 values found.');
       return;
     }
 
-    const result = await importManyProfiles(interaction.guildId, candidates, note);
+    const result = await importManyProfiles(candidates, note);
 
     await interaction.editReply(
-      `Import complete.\n` +
+      `Import complete (profiles).\n` +
         `Found: ${result.found}\n` +
-        `Processed: ${result.processed}${result.truncated ? ' (truncated to limit)' : ''}\n` +
+        `Processed: ${result.processed}${result.truncated ? ' (truncated)' : ''}\n` +
         `Added: ${result.added}\n` +
         `Updated: ${result.updated}\n` +
+        `Already existed: ${result.exists}\n` +
         `Failed: ${result.failed}`,
     );
     return;
   }
 }
 
-// --------- MESSAGE HANDLER (auto permalink) ---------
+async function handleSteamgroupsCommand(interaction: ChatInputCommandInteraction) {
+  if (!interaction.guildId) {
+    await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+    return;
+  }
+
+  const sub = interaction.options.getSubcommand();
+
+  if (sub === 'add') {
+    const input = interaction.options.getString('input', true);
+    const note = interaction.options.getString('note', false) ?? undefined;
+
+    const g = makeGroupFromInput(input, note);
+    if (!g) {
+      await interaction.reply({ content: 'Could not parse that as a Steam group URL.', ephemeral: true });
+      return;
+    }
+
+    const result = upsertGroup(g);
+
+    const msg =
+      result === 'added'
+        ? `✅ **Added group**\n${g.url}\nKey: \`${g.key}\``
+        : result === 'updated'
+          ? `✏️ **Updated group note**\n${g.url}\nKey: \`${g.key}\``
+          : `⚠️ **Group already exists**\n${g.url}\nKey: \`${g.key}\``;
+
+    await interaction.reply({ content: msg, ephemeral: true, allowedMentions: { parse: [] } });
+    return;
+  }
+
+  if (sub === 'remove') {
+    const key = interaction.options.getString('key', true).trim();
+    const ok = removeGroupByKey(key);
+
+    await interaction.reply({
+      content: ok ? `Removed group with key \`${key}\`.` : `Key \`${key}\` not found.`,
+      ephemeral: true,
+      allowedMentions: { parse: [] },
+    });
+    return;
+  }
+
+  if (sub === 'list') {
+    const list = getGroups();
+    if (list.length === 0) {
+      await interaction.reply({ content: 'No stored Steam groups yet.', ephemeral: true });
+      return;
+    }
+
+    const totalPages = Math.max(1, Math.ceil(list.length / LIST_PAGE_SIZE));
+    const requested = interaction.options.getInteger('page', false) ?? 1;
+    const page = Math.min(Math.max(requested, 1), totalPages);
+
+    const start = (page - 1) * LIST_PAGE_SIZE;
+    const slice = list.slice(start, start + LIST_PAGE_SIZE);
+
+    const lines = slice.map((g, idx) => {
+      const n = start + idx + 1;
+      const keyLine = `\`${g.key}\``;
+      const noteLine = g.note ? `\n↳ ${g.note}` : '';
+      return `**${n}.** ${g.url}\nKey: ${keyLine}${noteLine}`;
+    });
+
+    const embed = new EmbedBuilder()
+      .setTitle('Stored Steam groups')
+      .setDescription(lines.join('\n\n'))
+      .setFooter({ text: `Page ${page}/${totalPages} • Total ${list.length}` });
+
+    await interaction.reply({ embeds: [embed], ephemeral: true, allowedMentions: { parse: [] } });
+    return;
+  }
+
+  if (sub === 'clear') {
+    clearGroups();
+    await interaction.reply({ content: 'Cleared all stored Steam groups (global).', ephemeral: true });
+    return;
+  }
+
+  if (sub === 'import') {
+    const text = interaction.options.getString('text', false) ?? '';
+    const attachment = interaction.options.getAttachment('attachment', false);
+    const note = interaction.options.getString('note', false) ?? undefined;
+
+    if (!text && !attachment) {
+      await interaction.reply({ content: 'Provide `text` or an `attachment` (.txt).', ephemeral: true });
+      return;
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+
+    let inputText = text;
+    if (attachment) {
+      try {
+        inputText += '\n' + (await fetchTextFromUrl(attachment.url));
+      } catch (err: any) {
+        await interaction.editReply(`Failed to download attachment: ${err?.message ?? 'unknown error'}`);
+        return;
+      }
+    }
+
+    const candidates = extractGroupCandidatesFromText(inputText);
+    if (candidates.length === 0) {
+      await interaction.editReply('No Steam group links found.');
+      return;
+    }
+
+    const result = await importManyGroups(candidates, note);
+
+    await interaction.editReply(
+      `Import complete (groups).\n` +
+        `Found: ${result.found}\n` +
+        `Processed: ${result.processed}${result.truncated ? ' (truncated)' : ''}\n` +
+        `Added: ${result.added}\n` +
+        `Updated: ${result.updated}\n` +
+        `Already existed: ${result.exists}\n` +
+        `Failed: ${result.failed}`,
+    );
+    return;
+  }
+}
+
+// ---------------- MESSAGE HANDLER (auto permalink) ----------------
 async function handleMessage(message: Message, fromEdit: boolean) {
   try {
     if (!message.content) return;
@@ -588,6 +893,7 @@ async function handleMessage(message: Message, fromEdit: boolean) {
 
     const content = stripCodeBlocks(message.content);
 
+    // Profiles
     const vanityMatches = [...content.matchAll(STEAM_VANITY_ID_REGEX)].map((m) => m[0]);
     const userMatches = [...content.matchAll(STEAM_USER_REGEX)].map((m) => m[0]);
     const profileMatches = [...content.matchAll(STEAM_PROFILE_REGEX)].map((m) => m[0]);
@@ -596,31 +902,69 @@ async function handleMessage(message: Message, fromEdit: boolean) {
     STEAM_USER_REGEX.lastIndex = 0;
     STEAM_PROFILE_REGEX.lastIndex = 0;
 
-    if (vanityMatches.length === 0 && userMatches.length === 0 && profileMatches.length === 0) return;
+    // Groups
+    const groupsMatches = [...content.matchAll(STEAM_GROUPS_REGEX)].map((m) => m[0]);
+    const gidMatches = [...content.matchAll(STEAM_GID_REGEX)].map((m) => m[0]);
+    STEAM_GROUPS_REGEX.lastIndex = 0;
+    STEAM_GID_REGEX.lastIndex = 0;
 
-    const permalinks: string[] = [];
+    if (
+      vanityMatches.length === 0 &&
+      userMatches.length === 0 &&
+      profileMatches.length === 0 &&
+      groupsMatches.length === 0 &&
+      gidMatches.length === 0
+    ) return;
+
+    const profilePermalinks: string[] = [];
+    const groupLinks: string[] = [];
 
     for (const url of profileMatches) {
       const id64 = extractFirstGroup(url, STEAM_PROFILE_REGEX);
-      if (id64) permalinks.push(`https://steamcommunity.com/profiles/${id64}`);
+      if (id64) profilePermalinks.push(`https://steamcommunity.com/profiles/${id64}`);
     }
 
     for (const url of [...vanityMatches, ...userMatches]) {
       const id64 = await resolveToSteamId64(url);
-      if (id64) permalinks.push(`https://steamcommunity.com/profiles/${id64}`);
+      if (id64) profilePermalinks.push(`https://steamcommunity.com/profiles/${id64}`);
     }
 
-    const uniquePermalinks = uniqueStable(permalinks);
-    if (uniquePermalinks.length === 0) return;
+    // Groups: keep canonical (no reliable API resolution from /groups -> /gid)
+    for (const u of gidMatches) {
+      const gid = extractFirstGroup(u, STEAM_GID_REGEX);
+      if (gid) groupLinks.push(`https://steamcommunity.com/gid/${gid}`);
+    }
+    for (const u of groupsMatches) {
+      const name = extractFirstGroup(u, STEAM_GROUPS_REGEX);
+      if (name) groupLinks.push(`https://steamcommunity.com/groups/${name}`);
+    }
 
-    const embed = new EmbedBuilder()
-      .setTitle(uniquePermalinks.length === 1 ? 'Steam permalink' : 'Steam permalinks')
-      .setDescription(uniquePermalinks.join('\n'))
-      .setFooter({ text: fromEdit ? 'Detected after message edit.' : 'Detected in your message.' });
+    const uniqueProfiles = uniqueStable(profilePermalinks);
+    const uniqueGroups = uniqueStable(groupLinks);
+
+    if (uniqueProfiles.length === 0 && uniqueGroups.length === 0) return;
+
+    const embed = new EmbedBuilder().setFooter({
+      text: fromEdit ? 'Detected after message edit.' : 'Detected in your message.',
+    });
+
+    if (uniqueProfiles.length > 0) {
+      embed.addFields({
+        name: uniqueProfiles.length === 1 ? 'Steam profile permalink' : 'Steam profile permalinks',
+        value: uniqueProfiles.join('\n'),
+      });
+    }
+
+    if (uniqueGroups.length > 0) {
+      embed.addFields({
+        name: uniqueGroups.length === 1 ? 'Steam group link' : 'Steam group links',
+        value: uniqueGroups.join('\n'),
+      });
+    }
 
     await message.reply({
       embeds: [embed],
-      allowedMentions: { parse: [] }, // no pings
+      allowedMentions: { parse: [] },
     });
 
     repliedMessageIds.set(message.id, now);
@@ -630,7 +974,7 @@ async function handleMessage(message: Message, fromEdit: boolean) {
   }
 }
 
-// --------- EVENTS ---------
+// ---------------- EVENTS ----------------
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user?.tag}!`);
   try {
@@ -652,6 +996,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
     await handleSteamprofilesCommand(interaction);
     return;
   }
+
+  if (interaction.commandName === 'steamgroups') {
+    await handleSteamgroupsCommand(interaction);
+    return;
+  }
 });
 
 client.on(Events.MessageCreate, (message) => {
@@ -663,10 +1012,9 @@ client.on(Events.MessageUpdate, (_oldMsg, newMsg) => {
   void handleMessage(msg, true);
 });
 
-// --------- LOGIN ---------
+// ---------------- START ----------------
 client.login(DISCORD_TOKEN);
 
-// Keep-alive server (Render/Replit/etc.)
 http
   .createServer((_req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -674,7 +1022,6 @@ http
   })
   .listen(PORT);
 
-// Graceful shutdown
 process.on('SIGINT', async () => {
   console.log('Shutting down...');
   try {

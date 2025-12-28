@@ -2,3 +2,4 @@ node_modules/
 .env
 steampermalink-settings.json
 steamprofiles.json
+steamgroups.json
